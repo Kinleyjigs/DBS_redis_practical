@@ -1,7 +1,7 @@
 import redis
+import argparse
 from typing import Optional, List
 from datetime import date, timedelta
-
 
 class RealtimeAnalytics:
     """
@@ -11,6 +11,7 @@ class RealtimeAnalytics:
       - Daily Unique Visitors (UV) via HyperLogLog.
       - Weekly UV via PFMERGE (Exercise 1).
       - Stickiness Ratio (DAU / MAU) via PFMERGE of 30 days (Exercise 2).
+      - CLI report for a given date (Exercise 3).
     """
 
     def __init__(self, redis_client: Optional[redis.Redis] = None) -> None:
@@ -57,18 +58,8 @@ class RealtimeAnalytics:
         """
         Merge multiple daily HyperLogLog UV keys into a single destination key
         using PFMERGE, then return the approximate unique visitor count.
-
-        Args:
-            date_str_list: List of date strings e.g. ['2026-03-11', ..., '2026-03-17']
-            dest_key:      Destination Redis key for the merged HLL
-                           e.g. 'analytics:uv:week:2026-W12'
-
-        Returns:
-            Approximate unique visitors across all the given dates.
         """
         source_keys = [self._uv_key(d) for d in date_str_list]
-        # PFMERGE unions all daily HLL keys into dest_key
-        # duplicates across days are automatically deduplicated
         self.r.pfmerge(dest_key, *source_keys)
         return self.r.pfcount(dest_key)
 
@@ -78,102 +69,83 @@ class RealtimeAnalytics:
     def compute_stickiness(self, reference_date_str: str) -> float:
         """
         Compute the stickiness ratio = DAU / MAU.
-
-        DAU (Daily Active Users):
-            Exact count for reference_date_str using bitmap BITCOUNT.
-            Represents how many users were active today.
-
-        MAU (Monthly Active Users):
-            Approximate unique users over the 30-day window ending on
-            reference_date_str. Derived by merging 30 daily HLL keys
-            using PFMERGE, then PFCOUNT.
-            Represents how many unique users were active this month.
-
-        Stickiness = DAU / MAU:
-            A higher ratio means users return daily — the app is "sticky".
-            e.g. 0.50 means 50% of monthly users come back every day.
-
-        Args:
-            reference_date_str: The "today" date string (e.g. '2026-03-17').
-
-        Returns:
-            Stickiness ratio as a float between 0.0 and 1.0.
-            Returns 0.0 if MAU is zero to avoid division by zero.
+        DAU: exact count for today using bitmap BITCOUNT.
+        MAU: approximate unique users over 30 days using PFMERGE + PFCOUNT.
         """
         ref = date.fromisoformat(reference_date_str)
-
-        # Build the last 30 days including today
         last_30_days = [
             (ref - timedelta(days=i)).isoformat()
             for i in range(30)
         ]
-
-        # --- DAU: exact count from bitmap ---
         dau = self.count_daily_active_users(reference_date_str)
-
-        # --- MAU: merge 30 daily HLL keys into a temporary key ---
         mau_key = f"analytics:uv:mau_temp:{reference_date_str}"
         source_keys = [self._uv_key(d) for d in last_30_days]
         self.r.pfmerge(mau_key, *source_keys)
         mau = self.r.pfcount(mau_key)
-
-        # Delete temp key immediately — no need to persist it
         self.r.delete(mau_key)
-
-        # --- Stickiness = DAU / MAU ---
         if mau == 0:
             return 0.0
         return dau / mau
 
+    # -------------------------------------------------------
+    # Exercise 3: print_daily_report — CLI report for a given date
+    # -------------------------------------------------------
+    def print_daily_report(self, date_str: str) -> None:
+        """
+        Print DAU and UV report for a given date.
 
-def demo():
-    analytics = RealtimeAnalytics()
-    date_str = "2026-03-17"
+        DAU: exact count of users active on that day (bitmap BITCOUNT).
+        UV:  approximate unique visitors on that day (HyperLogLog PFCOUNT).
 
-    # Clear previous data
+        Args:
+            date_str: Date string in YYYY-MM-DD format passed from CLI.
+        """
+        dau = self.count_daily_active_users(date_str)
+        uv = self.count_unique_visitors(date_str)
+
+        print(f"=== Analytics Report for {date_str} ===")
+        print(f"  Daily Active Users (DAU) [exact]:    {dau}")
+        print(f"  Unique Visitors     (UV) [approx]:   {uv}")
+
+
+def seed_demo_data(analytics: RealtimeAnalytics, date_str: str) -> None:
+    """Seed some demo data so the CLI report has something to show."""
     analytics.r.delete(analytics._dau_key(date_str))
-    for i in range(30):
-        d = (date.fromisoformat(date_str) - timedelta(days=i)).isoformat()
-        analytics.r.delete(analytics._uv_key(d))
+    analytics.r.delete(analytics._uv_key(date_str))
 
-    print(f"Seeding data for stickiness demo ({date_str})...\n")
-
-    # Seed DAU — 3 users active today
+    # 3 users active today
     analytics.mark_user_active(date_str, 1)
     analytics.mark_user_active(date_str, 2)
     analytics.mark_user_active(date_str, 3)
 
-    # Seed UV across 3 days to simulate monthly visitors
-    # 7 unique users total across the month
-    analytics.add_visit("2026-03-17", "user1")
-    analytics.add_visit("2026-03-17", "user2")
-    analytics.add_visit("2026-03-17", "user3")
-    analytics.add_visit("2026-03-16", "user2")
-    analytics.add_visit("2026-03-16", "user4")
-    analytics.add_visit("2026-03-16", "user5")
-    analytics.add_visit("2026-03-15", "user1")
-    analytics.add_visit("2026-03-15", "user6")
-    analytics.add_visit("2026-03-15", "user7")
-
-    # Get DAU and MAU individually for display
-    dau = analytics.count_daily_active_users(date_str)
-
-    # Build MAU for display (separate from compute_stickiness temp key)
-    mau_display_key = "analytics:uv:mau:2026-03-17"
-    analytics.r.delete(mau_display_key)
-    last_30 = [
-        (date.fromisoformat(date_str) - timedelta(days=i)).isoformat()
-        for i in range(30)
-    ]
-    analytics.r.pfmerge(mau_display_key, *[analytics._uv_key(d) for d in last_30])
-    mau = analytics.r.pfcount(mau_display_key)
-
-    stickiness = analytics.compute_stickiness(date_str)
-
-    print(f"Daily Active Users  (DAU) [exact]:   {dau}")
-    print(f"Monthly Active Users(MAU) [approx]:  {mau}")
-    print(f"Stickiness Ratio (DAU/MAU):          {stickiness:.2f} ({stickiness:.2%})")
+    # 4 unique visitors today (user2 visits twice — still counts as 1)
+    analytics.add_visit(date_str, "user1")
+    analytics.add_visit(date_str, "user2")
+    analytics.add_visit(date_str, "user2")  # duplicate
+    analytics.add_visit(date_str, "user3")
+    analytics.add_visit(date_str, "user4")
 
 
+# -------------------------------------------------------
+# CLI entry point
+# Usage: python3 analytics.py --date 2026-03-17
+# -------------------------------------------------------
 if __name__ == "__main__":
-    demo()
+    parser = argparse.ArgumentParser(
+        description="Print DAU and UV analytics report for a given date."
+    )
+    parser.add_argument(
+        "--date",
+        type=str,
+        required=True,
+        help="Date in YYYY-MM-DD format (e.g. 2026-03-17)",
+    )
+    args = parser.parse_args()
+
+    analytics = RealtimeAnalytics()
+
+    # Seed demo data for the given date so report is not empty
+    seed_demo_data(analytics, args.date)
+
+    # Print the report for the given date
+    analytics.print_daily_report(args.date)
